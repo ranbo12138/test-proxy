@@ -44,28 +44,24 @@ def log_request(endpoint, status, error_type=None, retry_count=0):
 
 def smart_retry(func, max_retries=MAX_RETRIES):
     last_error = None
-    retry_count = 0
-    
     for attempt in range(max_retries):
         try:
             result = func()
             if result.status_code == 200:
-                return result, None, retry_count
+                return result, None, attempt
             try:
                 data = result.json()
                 if "error" in data and "rate limit" in str(data.get("error", "")).lower():
                     last_error = "rate_limit"
-                    retry_count += 1
                     continue
             except:
                 pass
-            return result, None, retry_count
+            return result, None, attempt
         except Exception as e:
             last_error = str(e)
-            retry_count += 1
             if attempt < max_retries - 1:
                 continue
-    return None, last_error, retry_count
+    return None, last_error, max_retries - 1
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def proxy_chat():
@@ -137,6 +133,7 @@ def proxy_models():
 def health():
     return jsonify({"status": "ok"}), 200
 
+# --- 主页管理面板 ---
 @app.route('/')
 def dashboard():
     with stats_lock:
@@ -170,19 +167,64 @@ def dashboard():
         .status-failed { color: #f44336; font-weight: 600; }
         .retry-badge { 
             display: inline-block; 
-            background: #ff9800; 
-            color: white; 
             padding: 2px 8px; 
             border-radius: 12px; 
             font-size: 12px; 
             font-weight: 600;
+            background: #e3f2fd;
+            color: #1976d2;
         }
-        .retry-badge.zero { background: #4caf50; }
-        .refresh { background: #2196f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
+        .retry-badge.high { background: #fff3e0; color: #f57c00; }
+        .refresh { background: #2196f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; margin-right: 10px; }
         .refresh:hover { background: #1976d2; }
+        .auto-refresh-toggle { background: #4caf50; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
+        .auto-refresh-toggle.off { background: #9e9e9e; }
         .info { background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3; }
         .info strong { color: #1976d2; }
+        .auto-refresh-status { display: inline-block; margin-left: 10px; color: #666; font-size: 14px; }
     </style>
+    <script>
+        let autoRefreshEnabled = true;
+        let countdown = 5;
+        let intervalId;
+        let countdownId;
+
+        function toggleAutoRefresh() {
+            autoRefreshEnabled = !autoRefreshEnabled;
+            const btn = document.getElementById('autoRefreshBtn');
+            const status = document.getElementById('refreshStatus');
+            
+            if (autoRefreshEnabled) {
+                btn.textContent = '⏸️ 暂停自动刷新';
+                btn.classList.remove('off');
+                startCountdown();
+            } else {
+                btn.textContent = '▶️ 启动自动刷新';
+                btn.classList.add('off');
+                status.textContent = '已暂停';
+                clearInterval(countdownId);
+            }
+        }
+
+        function startCountdown() {
+            countdown = 5;
+            const status = document.getElementById('refreshStatus');
+            
+            countdownId = setInterval(() => {
+                if (autoRefreshEnabled) {
+                    countdown--;
+                    status.textContent = `${countdown} 秒后刷新`;
+                    if (countdown <= 0) {
+                        location.reload();
+                    }
+                }
+            }, 1000);
+        }
+
+        window.onload = function() {
+            startCountdown();
+        };
+    </script>
 </head>
 <body>
     <div class="container">
@@ -191,10 +233,12 @@ def dashboard():
         <div class="info">
             <strong>API 接入地址：</strong> https://你的域名/v1/chat/completions<br>
             <strong>模型列表：</strong> https://你的域名/v1/models<br>
-            <strong>重试次数：</strong> {{ max_retries }} 次（无延迟快速重试）
+            <strong>最大重试次数：</strong> {{ max_retries }} 次（快速重试，无延迟）
         </div>
         
-        <button class="refresh" onclick="location.reload()">🔄 刷新数据</button>
+        <button class="refresh" onclick="location.reload()">🔄 立即刷新</button>
+        <button id="autoRefreshBtn" class="auto-refresh-toggle" onclick="toggleAutoRefresh()">⏸️ 暂停自动刷新</button>
+        <span id="refreshStatus" class="auto-refresh-status">5 秒后刷新</span>
         
         <div class="stats">
             <div class="stat-card">
@@ -231,8 +275,8 @@ def dashboard():
                         <th>时间</th>
                         <th>接口</th>
                         <th>状态</th>
-                        <th>错误类型</th>
                         <th>重试次数</th>
+                        <th>错误类型</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -241,14 +285,16 @@ def dashboard():
                         <td>{{ log.time }}</td>
                         <td>{{ log.endpoint }}</td>
                         <td class="status-{{ log.status }}">{{ log.status }}</td>
-                        <td>{{ log.error }}</td>
                         <td>
                             {% if log.retries == 0 %}
-                            <span class="retry-badge zero">0 次</span>
+                                <span class="retry-badge">首次成功</span>
+                            {% elif log.retries < 3 %}
+                                <span class="retry-badge">重试 {{ log.retries }} 次</span>
                             {% else %}
-                            <span class="retry-badge">{{ log.retries }} 次</span>
+                                <span class="retry-badge high">重试 {{ log.retries }} 次</span>
                             {% endif %}
                         </td>
+                        <td>{{ log.error }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
