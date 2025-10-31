@@ -1,24 +1,54 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, render_template_string
 import requests
 import os
 import time
+from datetime import datetime
+from collections import deque
+import threading
 
 app = Flask(__name__)
 
+# --- 配置 ---
 PROXY_URL = os.environ.get("PROXY_URL")
 API_KEY = os.environ.get("API_KEY")
 MY_ACCESS_KEY = os.environ.get("MY_ACCESS_KEY")
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 
+# --- 统计数据 ---
+stats = {
+    "total_requests": 0,
+    "success_requests": 0,
+    "failed_requests": 0,
+    "rate_limit_errors": 0,
+    "start_time": datetime.now()
+}
+recent_logs = deque(maxlen=50)
+stats_lock = threading.Lock()
+
+def log_request(endpoint, status, error_type=None):
+    with stats_lock:
+        stats["total_requests"] += 1
+        if status == "success":
+            stats["success_requests"] += 1
+        else:
+            stats["failed_requests"] += 1
+            if error_type == "rate_limit":
+                stats["rate_limit_errors"] += 1
+        
+        recent_logs.appendleft({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "endpoint": endpoint,
+            "status": status,
+            "error": error_type or "-"
+        })
+
 def smart_retry(func, max_retries=MAX_RETRIES):
     last_error = None
-    
     for attempt in range(max_retries):
         try:
             result = func()
             if result.status_code == 200:
                 return result, None
-            
             try:
                 data = result.json()
                 if "error" in data and "rate limit" in str(data.get("error", "")).lower():
@@ -28,22 +58,20 @@ def smart_retry(func, max_retries=MAX_RETRIES):
                     continue
             except:
                 pass
-            
             return result, None
-            
         except Exception as e:
             last_error = str(e)
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 time.sleep(wait_time)
                 continue
-    
     return None, last_error
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def proxy_chat():
     auth_header = request.headers.get('Authorization')
     if not auth_header or auth_header != f"Bearer {MY_ACCESS_KEY}":
+        log_request("/v1/chat/completions", "failed", "auth_error")
         return jsonify({"error": "Permission Denied"}), 401
 
     req_data = request.json
@@ -54,17 +82,12 @@ def proxy_chat():
             def make_request():
                 return requests.post(
                     f"{PROXY_URL}/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json=req_data,
-                    stream=True,
-                    timeout=60
+                    headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+                    json=req_data, stream=True, timeout=60
                 )
-            
             resp, error = smart_retry(make_request)
             if resp and resp.status_code == 200:
+                log_request("/v1/chat/completions", "success")
                 for line in resp.iter_lines():
                     if line:
                         decoded = line.decode('utf-8')
@@ -72,32 +95,28 @@ def proxy_chat():
                             decoded = 'data: ' + decoded
                         yield decoded + '\n\n'
             else:
+                log_request("/v1/chat/completions", "failed", error)
                 if error == "rate_limit":
                     yield 'data: {"error":"错误重试全都rate limit,请再次重试."}\n\n'
                 else:
                     yield f'data: {{"error":"请求失败: {error}"}}\n\n'
-
         return Response(generate(), content_type='text/event-stream')
-
     else:
         def make_request():
             return requests.post(
                 f"{PROXY_URL}/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json=req_data,
-                timeout=60
+                headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+                json=req_data, timeout=60
             )
-        
         resp, error = smart_retry(make_request)
         if resp:
             try:
+                log_request("/v1/chat/completions", "success")
                 return jsonify(resp.json()), resp.status_code
             except:
+                log_request("/v1/chat/completions", "failed", "parse_error")
                 return jsonify({"error": "Invalid response"}), 500
-        
+        log_request("/v1/chat/completions", "failed", error)
         if error == "rate_limit":
             return jsonify({"error": "错误重试全都rate limit,请再次重试."}), 429
         else:
@@ -108,13 +127,8 @@ def proxy_models():
     auth_header = request.headers.get('Authorization')
     if not auth_header or auth_header != f"Bearer {MY_ACCESS_KEY}":
         return jsonify({"error": "Permission Denied"}), 401
-
     try:
-        resp = requests.get(
-            f"{PROXY_URL}/v1/models",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            timeout=20
-        )
+        resp = requests.get(f"{PROXY_URL}/v1/models", headers={"Authorization": f"Bearer {API_KEY}"}, timeout=20)
         return jsonify(resp.json()), resp.status_code
     except:
         return jsonify({"error": "Failed to fetch models"}), 500
@@ -122,6 +136,103 @@ def proxy_models():
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"}), 200
+
+# --- Web 管理面板（根路径）---
+@app.route('/')
+def dashboard():
+    with stats_lock:
+        success_rate = (stats["success_requests"] / stats["total_requests"] * 100) if stats["total_requests"] > 0 else 0
+        uptime = str(datetime.now() - stats["start_time"]).split('.')[0]
+        
+    html = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Proxy 管理面板</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { color: #333; margin-bottom: 30px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stat-card h3 { color: #666; font-size: 14px; margin-bottom: 10px; }
+        .stat-card .value { font-size: 32px; font-weight: bold; color: #333; }
+        .stat-card.success .value { color: #4caf50; }
+        .stat-card.error .value { color: #f44336; }
+        .logs { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .logs h2 { margin-bottom: 15px; color: #333; }
+        table { width: 100%; border-collapse: collapse; }
+        th { background: #f5f5f5; padding: 12px; text-align: left; font-weight: 600; color: #666; }
+        td { padding: 12px; border-bottom: 1px solid #eee; }
+        .status-success { color: #4caf50; font-weight: 600; }
+        .status-failed { color: #f44336; font-weight: 600; }
+        .refresh { background: #2196f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
+        .refresh:hover { background: #1976d2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 LLM Proxy 管理面板</h1>
+        <button class="refresh" onclick="location.reload()">🔄 刷新数据</button>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <h3>总请求数</h3>
+                <div class="value">{{ stats.total_requests }}</div>
+            </div>
+            <div class="stat-card success">
+                <h3>成功请求</h3>
+                <div class="value">{{ stats.success_requests }}</div>
+            </div>
+            <div class="stat-card error">
+                <h3>失败请求</h3>
+                <div class="value">{{ stats.failed_requests }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>成功率</h3>
+                <div class="value">{{ "%.1f"|format(success_rate) }}%</div>
+            </div>
+            <div class="stat-card error">
+                <h3>限流错误</h3>
+                <div class="value">{{ stats.rate_limit_errors }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>运行时间</h3>
+                <div class="value" style="font-size: 20px;">{{ uptime }}</div>
+            </div>
+        </div>
+        
+        <div class="logs">
+            <h2>📋 最近请求日志 (最新 50 条)</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>时间</th>
+                        <th>接口</th>
+                        <th>状态</th>
+                        <th>错误类型</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for log in logs %}
+                    <tr>
+                        <td>{{ log.time }}</td>
+                        <td>{{ log.endpoint }}</td>
+                        <td class="status-{{ log.status }}">{{ log.status }}</td>
+                        <td>{{ log.error }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body>
+</html>
+    '''
+    return render_template_string(html, stats=stats, success_rate=success_rate, uptime=uptime, logs=list(recent_logs))
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)
