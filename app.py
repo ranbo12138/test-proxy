@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify, Response, render_template_string
 import requests
 import os
-import time
 from datetime import datetime
 from collections import deque
 import threading
@@ -12,7 +11,7 @@ app = Flask(__name__)
 PROXY_URL = os.environ.get("PROXY_URL")
 API_KEY = os.environ.get("API_KEY")
 MY_ACCESS_KEY = os.environ.get("MY_ACCESS_KEY")
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 
 # --- 统计数据 ---
 stats = {
@@ -53,18 +52,14 @@ def smart_retry(func, max_retries=MAX_RETRIES):
                 data = result.json()
                 if "error" in data and "rate limit" in str(data.get("error", "")).lower():
                     last_error = "rate_limit"
-                    wait_time = 2 ** attempt
-                    time.sleep(wait_time)
-                    continue
+                    continue  # 直接重试，不等待
             except:
                 pass
             return result, None
         except Exception as e:
             last_error = str(e)
             if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                time.sleep(wait_time)
-                continue
+                continue  # 直接重试，不等待
     return None, last_error
 
 @app.route('/v1/chat/completions', methods=['POST'])
@@ -137,7 +132,7 @@ def proxy_models():
 def health():
     return jsonify({"status": "ok"}), 200
 
-# --- Web 管理面板（根路径）---
+# --- 主页就是管理面板 ---
 @app.route('/')
 def dashboard():
     with stats_lock:
@@ -171,11 +166,20 @@ def dashboard():
         .status-failed { color: #f44336; font-weight: 600; }
         .refresh { background: #2196f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
         .refresh:hover { background: #1976d2; }
+        .info { background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3; }
+        .info strong { color: #1976d2; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🚀 LLM Proxy 管理面板</h1>
+        
+        <div class="info">
+            <strong>API 接入地址：</strong> https://你的域名/v1/chat/completions<br>
+            <strong>模型列表：</strong> https://你的域名/v1/models<br>
+            <strong>重试次数：</strong> {{ max_retries }} 次（无延迟快速重试）
+        </div>
+        
         <button class="refresh" onclick="location.reload()">🔄 刷新数据</button>
         
         <div class="stats">
@@ -232,7 +236,7 @@ def dashboard():
 </body>
 </html>
     '''
-    return render_template_string(html, stats=stats, success_rate=success_rate, uptime=uptime, logs=list(recent_logs))
+    return render_template_string(html, stats=stats, success_rate=success_rate, uptime=uptime, logs=list(recent_logs), max_retries=MAX_RETRIES)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)
