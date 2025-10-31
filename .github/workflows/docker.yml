@@ -5,6 +5,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:      # <-- 我们在这里添加了权限设置
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v3
       - uses: docker/login-action@v2
