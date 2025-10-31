@@ -5,7 +5,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
+    permissions:      # <-- 我们在这里添加了权限设置
       contents: read
       packages: write
     steps:
