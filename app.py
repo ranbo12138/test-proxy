@@ -11,26 +11,34 @@ MY_ACCESS_KEY = os.environ.get("MY_ACCESS_KEY")
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 
 def smart_retry(func, max_retries=MAX_RETRIES):
+    last_error = None
+    
     for attempt in range(max_retries):
         try:
             result = func()
             if result.status_code == 200:
-                return result
+                return result, None
+            
             try:
                 data = result.json()
                 if "error" in data and "rate limit" in str(data.get("error", "")).lower():
+                    last_error = "rate_limit"
                     wait_time = 2 ** attempt
                     time.sleep(wait_time)
                     continue
             except:
                 pass
-            return result
+            
+            return result, None
+            
         except Exception as e:
+            last_error = str(e)
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 time.sleep(wait_time)
                 continue
-    return None
+    
+    return None, last_error
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def proxy_chat():
@@ -55,17 +63,19 @@ def proxy_chat():
                     timeout=60
                 )
             
-            resp = smart_retry(make_request)
+            resp, error = smart_retry(make_request)
             if resp and resp.status_code == 200:
                 for line in resp.iter_lines():
                     if line:
                         decoded = line.decode('utf-8')
-                        # 确保每行都符合 SSE 格式
                         if not decoded.startswith('data: '):
                             decoded = 'data: ' + decoded
                         yield decoded + '\n\n'
             else:
-                yield 'data: {"error":"Stream failed"}\n\n'
+                if error == "rate_limit":
+                    yield 'data: {"error":"错误重试全都rate limit,请再次重试."}\n\n'
+                else:
+                    yield f'data: {{"error":"请求失败: {error}"}}\n\n'
 
         return Response(generate(), content_type='text/event-stream')
 
@@ -81,13 +91,17 @@ def proxy_chat():
                 timeout=60
             )
         
-        resp = smart_retry(make_request)
+        resp, error = smart_retry(make_request)
         if resp:
             try:
                 return jsonify(resp.json()), resp.status_code
             except:
                 return jsonify({"error": "Invalid response"}), 500
-        return jsonify({"error": "All retries failed"}), 500
+        
+        if error == "rate_limit":
+            return jsonify({"error": "错误重试全都rate limit,请再次重试."}), 429
+        else:
+            return jsonify({"error": f"请求失败: {error}"}), 500
 
 @app.route('/v1/models', methods=['GET'])
 def proxy_models():
