@@ -16,7 +16,6 @@ def smart_retry(func, max_retries=MAX_RETRIES):
             result = func()
             if result.status_code == 200:
                 return result
-            # 检查是否是限流错误
             try:
                 data = result.json()
                 if "error" in data and "rate limit" in str(data.get("error", "")).lower():
@@ -42,7 +41,6 @@ def proxy_chat():
     req_data = request.json
     is_stream = req_data.get('stream', False)
 
-    # 流式输出
     if is_stream:
         def generate():
             def make_request():
@@ -61,13 +59,16 @@ def proxy_chat():
             if resp and resp.status_code == 200:
                 for line in resp.iter_lines():
                     if line:
-                        yield line.decode('utf-8') + '\n'
+                        decoded = line.decode('utf-8')
+                        # 确保每行都符合 SSE 格式
+                        if not decoded.startswith('data: '):
+                            decoded = 'data: ' + decoded
+                        yield decoded + '\n\n'
             else:
                 yield 'data: {"error":"Stream failed"}\n\n'
 
         return Response(generate(), content_type='text/event-stream')
 
-    # 非流式输出
     else:
         def make_request():
             return requests.post(
@@ -85,7 +86,7 @@ def proxy_chat():
             try:
                 return jsonify(resp.json()), resp.status_code
             except:
-                return jsonify({"error": "Invalid response from upstream"}), 500
+                return jsonify({"error": "Invalid response"}), 500
         return jsonify({"error": "All retries failed"}), 500
 
 @app.route('/v1/models', methods=['GET'])
@@ -101,8 +102,8 @@ def proxy_models():
             timeout=20
         )
         return jsonify(resp.json()), resp.status_code
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except:
+        return jsonify({"error": "Failed to fetch models"}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
