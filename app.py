@@ -24,7 +24,7 @@ stats = {
 recent_logs = deque(maxlen=50)
 stats_lock = threading.Lock()
 
-def log_request(endpoint, status, error_type=None):
+def log_request(endpoint, status, error_type=None, retry_count=0):
     with stats_lock:
         stats["total_requests"] += 1
         if status == "success":
@@ -38,35 +38,40 @@ def log_request(endpoint, status, error_type=None):
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "endpoint": endpoint,
             "status": status,
-            "error": error_type or "-"
+            "error": error_type or "-",
+            "retries": retry_count
         })
 
 def smart_retry(func, max_retries=MAX_RETRIES):
     last_error = None
+    retry_count = 0
+    
     for attempt in range(max_retries):
         try:
             result = func()
             if result.status_code == 200:
-                return result, None
+                return result, None, retry_count
             try:
                 data = result.json()
                 if "error" in data and "rate limit" in str(data.get("error", "")).lower():
                     last_error = "rate_limit"
-                    continue  # 直接重试，不等待
+                    retry_count += 1
+                    continue
             except:
                 pass
-            return result, None
+            return result, None, retry_count
         except Exception as e:
             last_error = str(e)
+            retry_count += 1
             if attempt < max_retries - 1:
-                continue  # 直接重试，不等待
-    return None, last_error
+                continue
+    return None, last_error, retry_count
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def proxy_chat():
     auth_header = request.headers.get('Authorization')
     if not auth_header or auth_header != f"Bearer {MY_ACCESS_KEY}":
-        log_request("/v1/chat/completions", "failed", "auth_error")
+        log_request("/v1/chat/completions", "failed", "auth_error", 0)
         return jsonify({"error": "Permission Denied"}), 401
 
     req_data = request.json
@@ -80,9 +85,9 @@ def proxy_chat():
                     headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
                     json=req_data, stream=True, timeout=60
                 )
-            resp, error = smart_retry(make_request)
+            resp, error, retry_count = smart_retry(make_request)
             if resp and resp.status_code == 200:
-                log_request("/v1/chat/completions", "success")
+                log_request("/v1/chat/completions", "success", None, retry_count)
                 for line in resp.iter_lines():
                     if line:
                         decoded = line.decode('utf-8')
@@ -90,7 +95,7 @@ def proxy_chat():
                             decoded = 'data: ' + decoded
                         yield decoded + '\n\n'
             else:
-                log_request("/v1/chat/completions", "failed", error)
+                log_request("/v1/chat/completions", "failed", error, retry_count)
                 if error == "rate_limit":
                     yield 'data: {"error":"错误重试全都rate limit,请再次重试."}\n\n'
                 else:
@@ -103,15 +108,15 @@ def proxy_chat():
                 headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
                 json=req_data, timeout=60
             )
-        resp, error = smart_retry(make_request)
+        resp, error, retry_count = smart_retry(make_request)
         if resp:
             try:
-                log_request("/v1/chat/completions", "success")
+                log_request("/v1/chat/completions", "success", None, retry_count)
                 return jsonify(resp.json()), resp.status_code
             except:
-                log_request("/v1/chat/completions", "failed", "parse_error")
+                log_request("/v1/chat/completions", "failed", "parse_error", retry_count)
                 return jsonify({"error": "Invalid response"}), 500
-        log_request("/v1/chat/completions", "failed", error)
+        log_request("/v1/chat/completions", "failed", error, retry_count)
         if error == "rate_limit":
             return jsonify({"error": "错误重试全都rate limit,请再次重试."}), 429
         else:
@@ -132,7 +137,6 @@ def proxy_models():
 def health():
     return jsonify({"status": "ok"}), 200
 
-# --- 主页就是管理面板 ---
 @app.route('/')
 def dashboard():
     with stats_lock:
@@ -164,6 +168,16 @@ def dashboard():
         td { padding: 12px; border-bottom: 1px solid #eee; }
         .status-success { color: #4caf50; font-weight: 600; }
         .status-failed { color: #f44336; font-weight: 600; }
+        .retry-badge { 
+            display: inline-block; 
+            background: #ff9800; 
+            color: white; 
+            padding: 2px 8px; 
+            border-radius: 12px; 
+            font-size: 12px; 
+            font-weight: 600;
+        }
+        .retry-badge.zero { background: #4caf50; }
         .refresh { background: #2196f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
         .refresh:hover { background: #1976d2; }
         .info { background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3; }
@@ -218,6 +232,7 @@ def dashboard():
                         <th>接口</th>
                         <th>状态</th>
                         <th>错误类型</th>
+                        <th>重试次数</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -227,6 +242,13 @@ def dashboard():
                         <td>{{ log.endpoint }}</td>
                         <td class="status-{{ log.status }}">{{ log.status }}</td>
                         <td>{{ log.error }}</td>
+                        <td>
+                            {% if log.retries == 0 %}
+                            <span class="retry-badge zero">0 次</span>
+                            {% else %}
+                            <span class="retry-badge">{{ log.retries }} 次</span>
+                            {% endif %}
+                        </td>
                     </tr>
                     {% endfor %}
                 </tbody>
