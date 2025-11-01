@@ -21,6 +21,34 @@ def log_all_requests():
             "detail": f"Headers: {dict(request.headers)}"[:200]
         })
 
+# CORS 支持（完整版）
+@app.after_request
+def after_request(response):
+    origin = request.headers.get('Origin')
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+    else:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,x-api-key,anthropic-version'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
+
+# OPTIONS 预检请求处理
+@app.route('/v1/messages', methods=['OPTIONS'])
+def options_messages():
+    return '', 204
+
+@app.route('/v1/chat/completions', methods=['OPTIONS'])
+def options_chat():
+    return '', 204
+
+@app.route('/v1/models', methods=['OPTIONS'])
+def options_models():
+    return '', 204
+
 # --- 配置 ---
 PROXY_URL = os.environ.get("PROXY_URL")
 API_KEY = os.environ.get("API_KEY")
