@@ -8,47 +8,6 @@ import threading
 
 app = Flask(__name__)
 
-# 记录所有请求（用于调试）
-@app.before_request
-def log_all_requests():
-    with stats_lock:
-        recent_logs.appendleft({
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "endpoint": f"{request.method} {request.path}",
-            "status": "received",
-            "error": "-",
-            "retries": 0,
-            "detail": f"Headers: {dict(request.headers)}"[:200]
-        })
-
-# CORS 支持（完整版）
-@app.after_request
-def after_request(response):
-    origin = request.headers.get('Origin')
-    if origin:
-        response.headers['Access-Control-Allow-Origin'] = origin
-    else:
-        response.headers['Access-Control-Allow-Origin'] = '*'
-    
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,x-api-key,anthropic-version'
-    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
-    response.headers['Access-Control-Allow-Credentials'] = 'true'
-    response.headers['Access-Control-Max-Age'] = '3600'
-    return response
-
-# OPTIONS 预检请求处理
-@app.route('/v1/messages', methods=['OPTIONS'])
-def options_messages():
-    return '', 204
-
-@app.route('/v1/chat/completions', methods=['OPTIONS'])
-def options_chat():
-    return '', 204
-
-@app.route('/v1/models', methods=['OPTIONS'])
-def options_models():
-    return '', 204
-
 # --- 配置 ---
 PROXY_URL = os.environ.get("PROXY_URL")
 API_KEY = os.environ.get("API_KEY")
@@ -65,6 +24,50 @@ stats = {
 }
 recent_logs = deque(maxlen=50)
 stats_lock = threading.Lock()
+
+# --- CORS 预检请求（必须放在最前面）---
+@app.route('/v1/messages', methods=['OPTIONS'])
+@app.route('/v1/chat/completions', methods=['OPTIONS'])
+@app.route('/v1/models', methods=['OPTIONS'])
+def handle_options():
+    response = app.make_default_options_response()
+    return response
+
+# --- CORS headers ---
+@app.after_request
+def after_request(response):
+    origin = request.headers.get('Origin')
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+    else:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,x-api-key,anthropic-version,anthropic-dangerous-direct-browser-access'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Access-Control-Max-Age'] = '86400'
+    return response
+
+# --- 记录所有请求（用于调试）---
+@app.before_request
+def log_all_requests():
+    # OPTIONS 请求不记录
+    if request.method == 'OPTIONS':
+        return None
+    
+    # 管理面板首页和健康检查不记录
+    if request.path in ['/', '/health']:
+        return None
+    
+    with stats_lock:
+        recent_logs.appendleft({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "endpoint": f"{request.method} {request.path}",
+            "status": "received",
+            "error": "-",
+            "retries": 0,
+            "detail": f"Headers: {dict(request.headers)}"[:200]
+        })
 
 def log_request(endpoint, status, error_type=None, retry_count=0, detail=None):
     with stats_lock:
@@ -199,7 +202,6 @@ def proxy_chat():
 def proxy_anthropic():
     auth_header = request.headers.get('x-api-key') or request.headers.get('Authorization')
     
-    # 支持两种认证方式
     if auth_header:
         if auth_header.startswith('Bearer '):
             auth_header = auth_header[7:]
@@ -323,6 +325,7 @@ def dashboard():
         td { padding: 12px; border-bottom: 1px solid #eee; }
         .status-success { color: #4caf50; font-weight: 600; }
         .status-failed { color: #f44336; font-weight: 600; }
+        .status-received { color: #2196f3; font-weight: 600; }
         .retry-badge { 
             display: inline-block; 
             padding: 2px 8px; 
