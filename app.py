@@ -8,6 +8,19 @@ import threading
 
 app = Flask(__name__)
 
+# 记录所有请求（用于调试）
+@app.before_request
+def log_all_requests():
+    with stats_lock:
+        recent_logs.appendleft({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "endpoint": f"{request.method} {request.path}",
+            "status": "received",
+            "error": "-",
+            "retries": 0,
+            "detail": f"Headers: {dict(request.headers)}"[:200]
+        })
+
 # --- 配置 ---
 PROXY_URL = os.environ.get("PROXY_URL")
 API_KEY = os.environ.get("API_KEY")
