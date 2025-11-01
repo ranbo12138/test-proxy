@@ -42,7 +42,6 @@ def log_request(endpoint, status, error_type=None, retry_count=0):
             "retries": retry_count
         })
 
-# 非流式请求的重试
 def smart_retry_non_stream(func, max_retries=MAX_RETRIES):
     last_error = "unknown_error"
     for attempt in range(max_retries):
@@ -93,9 +92,7 @@ def proxy_chat():
     is_stream = req_data.get('stream', False)
 
     if is_stream:
-        # 流式模式：直接转发，不在这里做重试（因为流已经开始了就无法重试）
         def generate():
-            retry_count = 0
             for attempt in range(MAX_RETRIES):
                 try:
                     resp = requests.post(
@@ -103,27 +100,24 @@ def proxy_chat():
                         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
                         json=req_data,
                         stream=True,
-                        timeout=180  # 增加到 3 分钟
+                        timeout=180
                     )
                     
                     if resp.status_code == 200:
                         log_request("/v1/chat/completions", "success", None, attempt)
-                        # 成功，开始流式传输
                         for line in resp.iter_lines():
                             if line:
                                 decoded = line.decode('utf-8')
                                 if not decoded.startswith('data: '):
                                     decoded = 'data: ' + decoded
                                 yield decoded + '\n\n'
-                        return  # 成功完成，退出
+                        return
                     else:
-                        # 检查是否是限流错误
                         try:
                             data = resp.json()
                             if "error" in data and "rate limit" in str(data.get("error", "")).lower():
-                                retry_count = attempt
                                 if attempt < MAX_RETRIES - 1:
-                                    continue  # 重试
+                                    continue
                                 else:
                                     log_request("/v1/chat/completions", "failed", "rate_limit", attempt)
                                     yield 'data: {"error":{"message":"错误重试全都rate limit,请再次重试.","type":"rate_limit_error"}}\n\n'
@@ -131,7 +125,6 @@ def proxy_chat():
                         except:
                             pass
                         
-                        # 其他错误
                         log_request("/v1/chat/completions", "failed", f"http_{resp.status_code}", attempt)
                         yield f'data: {{"error":{{"message":"上游返回错误: {resp.status_code}","type":"upstream_error"}}}}\n\n'
                         return
@@ -149,14 +142,12 @@ def proxy_chat():
                     yield f'data: {{"error":{{"message":"请求异常: {type(e).__name__}","type":"proxy_error"}}}}\n\n'
                     return
             
-            # 所有重试都失败
             log_request("/v1/chat/completions", "failed", "all_retries_failed", MAX_RETRIES - 1)
             yield 'data: {"error":{"message":"所有重试都失败了","type":"proxy_error"}}\n\n'
         
         return Response(generate(), content_type='text/event-stream')
     
     else:
-        # 非流式模式
         def make_request():
             return requests.post(
                 f"{PROXY_URL}/v1/chat/completions",
@@ -197,7 +188,7 @@ def proxy_models():
     except:
         return jsonify({"error": {"message": "Failed to fetch models", "type": "proxy_error"}}), 500
 
-@app.route('/health', methods='GET'])
+@app.route('/health', methods=['GET'])  # ✅ 修复了这里
 def health():
     return jsonify({"status": "ok"}), 200
 
