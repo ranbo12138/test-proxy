@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify, Response, render_template_string
 import requests
 import os
-import json
 from datetime import datetime
 from collections import deque
 import threading
@@ -25,15 +24,7 @@ stats = {
 recent_logs = deque(maxlen=50)
 stats_lock = threading.Lock()
 
-# --- CORS 预检请求（必须放在最前面）---
-@app.route('/v1/messages', methods=['OPTIONS'])
-@app.route('/v1/chat/completions', methods=['OPTIONS'])
-@app.route('/v1/models', methods=['OPTIONS'])
-def handle_options():
-    response = app.make_default_options_response()
-    return response
-
-# --- CORS headers ---
+# --- CORS 支持 ---
 @app.after_request
 def after_request(response):
     origin = request.headers.get('Origin')
@@ -42,11 +33,17 @@ def after_request(response):
     else:
         response.headers['Access-Control-Allow-Origin'] = '*'
     
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,x-api-key,anthropic-version,anthropic-dangerous-direct-browser-access'
-    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
     response.headers['Access-Control-Allow-Credentials'] = 'true'
     response.headers['Access-Control-Max-Age'] = '86400'
     return response
+
+# --- OPTIONS 预检请求 ---
+@app.route('/v1/chat/completions', methods=['OPTIONS'])
+@app.route('/v1/models', methods=['OPTIONS'])
+def handle_options():
+    return '', 204
 
 # --- 记录所有请求（用于调试）---
 @app.before_request
@@ -59,11 +56,16 @@ def log_all_requests():
     if request.path in ['/', '/health']:
         return None
     
+    # API 请求不记录（因为会在具体的路由函数里记录）
+    if request.path.startswith('/v1/'):
+        return None
+    
+    # 只记录其他奇怪的访问
     with stats_lock:
         recent_logs.appendleft({
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "endpoint": f"{request.method} {request.path}",
-            "status": "received",
+            "status": "unknown",
             "error": "-",
             "retries": 0,
             "detail": f"Headers: {dict(request.headers)}"[:200]
@@ -101,11 +103,6 @@ def smart_retry(func, max_retries=MAX_RETRIES):
                 data = result.json()
                 error_msg = str(data.get("error", {}))
                 
-                if "sensitive" in error_msg.lower():
-                    last_error = "sensitive_words"
-                    last_detail = "上游检测到敏感词"
-                    return None, last_error, attempt, last_detail
-                
                 if "rate limit" in error_msg.lower() or "rate_limit" in error_msg.lower():
                     last_error = "rate_limit"
                     last_detail = error_msg[:200]
@@ -131,7 +128,6 @@ def smart_retry(func, max_retries=MAX_RETRIES):
     
     return None, last_error or "unknown", max_retries - 1, last_detail or "未知错误"
 
-# --- OpenAI 格式接口 ---
 @app.route('/v1/chat/completions', methods=['POST'])
 def proxy_chat():
     auth_header = request.headers.get('Authorization')
@@ -168,8 +164,6 @@ def proxy_chat():
                 log_request("/v1/chat/completions", "failed", error, retry_count, detail)
                 if error == "rate_limit":
                     yield 'data: {"error":"错误重试全都rate limit,请再次重试."}\n\n'
-                elif error == "sensitive_words":
-                    yield 'data: {"error":"内容包含敏感词，已被上游拦截"}\n\n'
                 else:
                     yield f'data: {{"error":"请求失败: {error}"}}\n\n'
         return Response(generate(), content_type='text/event-stream')
@@ -192,92 +186,8 @@ def proxy_chat():
         log_request("/v1/chat/completions", "failed", error, retry_count, detail)
         if error == "rate_limit":
             return jsonify({"error": "错误重试全都rate limit,请再次重试."}), 429
-        elif error == "sensitive_words":
-            return jsonify({"error": "内容包含敏感词，已被上游拦截"}), 400
         else:
             return jsonify({"error": f"请求失败: {error}", "detail": detail}), 500
-
-# --- Anthropic (Claude) 格式接口 ---
-@app.route('/v1/messages', methods=['POST'])
-def proxy_anthropic():
-    auth_header = request.headers.get('x-api-key') or request.headers.get('Authorization')
-    
-    if auth_header:
-        if auth_header.startswith('Bearer '):
-            auth_header = auth_header[7:]
-        if auth_header != MY_ACCESS_KEY:
-            log_request("/v1/messages", "failed", "auth_error", 0)
-            return jsonify({"error": {"type": "authentication_error", "message": "Invalid API Key"}}), 401
-    else:
-        log_request("/v1/messages", "failed", "auth_error", 0)
-        return jsonify({"error": {"type": "authentication_error", "message": "Missing API Key"}}), 401
-
-    try:
-        req_data = request.json
-    except Exception as e:
-        log_request("/v1/messages", "failed", "invalid_json", 0, str(e)[:200])
-        return jsonify({"error": {"type": "invalid_request_error", "message": "Invalid JSON"}}), 400
-
-    is_stream = req_data.get('stream', False)
-
-    if is_stream:
-        def generate():
-            def make_request():
-                headers = {
-                    "x-api-key": API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json"
-                }
-                return requests.post(
-                    f"{PROXY_URL}/v1/messages",
-                    headers=headers,
-                    json=req_data, stream=True, timeout=60
-                )
-            resp, error, retry_count, detail = smart_retry(make_request)
-            if resp and resp.status_code == 200:
-                log_request("/v1/messages", "success", None, retry_count)
-                for line in resp.iter_lines():
-                    if line:
-                        yield line.decode('utf-8') + '\n'
-            else:
-                log_request("/v1/messages", "failed", error, retry_count, detail)
-                error_response = {
-                    "type": "error",
-                    "error": {
-                        "type": "rate_limit_error" if error == "rate_limit" else "api_error",
-                        "message": detail or "请求失败"
-                    }
-                }
-                yield f"data: {json.dumps(error_response)}\n\n"
-        return Response(generate(), content_type='text/event-stream')
-    else:
-        def make_request():
-            headers = {
-                "x-api-key": API_KEY,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json"
-            }
-            return requests.post(
-                f"{PROXY_URL}/v1/messages",
-                headers=headers,
-                json=req_data, timeout=60
-            )
-        resp, error, retry_count, detail = smart_retry(make_request)
-        if resp:
-            try:
-                log_request("/v1/messages", "success", None, retry_count)
-                return jsonify(resp.json()), resp.status_code
-            except Exception as e:
-                log_request("/v1/messages", "failed", "parse_error", retry_count, str(e)[:200])
-                return jsonify({"error": {"type": "api_error", "message": "Invalid response"}}), 500
-        
-        log_request("/v1/messages", "failed", error, retry_count, detail)
-        return jsonify({
-            "error": {
-                "type": "rate_limit_error" if error == "rate_limit" else "api_error",
-                "message": detail or "请求失败"
-            }
-        }), 429 if error == "rate_limit" else 500
 
 @app.route('/v1/models', methods=['GET'])
 def proxy_models():
@@ -325,7 +235,6 @@ def dashboard():
         td { padding: 12px; border-bottom: 1px solid #eee; }
         .status-success { color: #4caf50; font-weight: 600; }
         .status-failed { color: #f44336; font-weight: 600; }
-        .status-received { color: #2196f3; font-weight: 600; }
         .retry-badge { 
             display: inline-block; 
             padding: 2px 8px; 
@@ -348,8 +257,7 @@ def dashboard():
         <h1>🚀 LLM Proxy 管理面板</h1>
         
         <div class="info">
-            <strong>OpenAI 格式：</strong> https://你的域名/v1/chat/completions<br>
-            <strong>Anthropic 格式：</strong> https://你的域名/v1/messages<br>
+            <strong>API 接口：</strong> https://你的域名/v1/chat/completions<br>
             <strong>模型列表：</strong> https://你的域名/v1/models<br>
             <strong>最大重试次数：</strong> {{ max_retries }} 次（快速重试，无延迟）
         </div>
