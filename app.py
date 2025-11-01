@@ -7,8 +7,6 @@ import threading
 
 app = Flask(__name__)
 
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
-
 # --- 配置 ---
 PROXY_URL = os.environ.get("PROXY_URL")
 API_KEY = os.environ.get("API_KEY")
@@ -51,7 +49,6 @@ def smart_retry_non_stream(func, max_retries=MAX_RETRIES):
             result = func()
             if result.status_code == 200:
                 return result, None, attempt
-            
             try:
                 data = result.json()
                 if "error" in data:
@@ -65,9 +62,7 @@ def smart_retry_non_stream(func, max_retries=MAX_RETRIES):
             except:
                 last_error = f"http_error_{result.status_code}"
                 return result, last_error, attempt
-            
             return result, None, attempt
-            
         except requests.exceptions.Timeout:
             last_error = "timeout"
             if attempt < max_retries - 1:
@@ -80,7 +75,6 @@ def smart_retry_non_stream(func, max_retries=MAX_RETRIES):
             last_error = f"exception_{type(e).__name__}"
             if attempt < max_retries - 1:
                 continue
-    
     return None, last_error, max_retries - 1
 
 @app.route('/v1/chat/completions', methods=['POST'])
@@ -90,8 +84,15 @@ def proxy_chat():
         log_request("/v1/chat/completions", "failed", "auth_error", 0)
         return jsonify({"error": {"message": "Permission Denied", "type": "auth_error"}}), 401
 
-    req_data = request.json
-    is_stream = req_data.get('stream', False)
+    # ✅ 关键改动：直接获取原始数据
+    raw_data = request.get_data()
+    
+    try:
+        req_data = request.json
+        is_stream = req_data.get('stream', False)
+    except:
+        # 如果 JSON 解析失败，我们假设它不是流式请求
+        is_stream = False
 
     if is_stream:
         def generate():
@@ -100,7 +101,7 @@ def proxy_chat():
                     resp = requests.post(
                         f"{PROXY_URL}/v1/chat/completions",
                         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-                        json=req_data,
+                        data=raw_data,  # ✅ 使用原始数据
                         stream=True,
                         timeout=180
                     )
@@ -154,7 +155,7 @@ def proxy_chat():
             return requests.post(
                 f"{PROXY_URL}/v1/chat/completions",
                 headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-                json=req_data,
+                data=raw_data,  # ✅ 使用原始数据
                 timeout=180
             )
         
@@ -190,7 +191,7 @@ def proxy_models():
     except:
         return jsonify({"error": {"message": "Failed to fetch models", "type": "proxy_error"}}), 500
 
-@app.route('/health', methods=['GET'])  # ✅ 修复了这里
+@app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"}), 200
 
