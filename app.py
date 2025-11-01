@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response, render_template_string
+from flask import Flask, request, Response, render_template_string
 import requests
 import os
 from datetime import datetime
@@ -42,158 +42,108 @@ def log_request(endpoint, status, error_type=None, retry_count=0):
             "retries": retry_count
         })
 
-def smart_retry_non_stream(func, max_retries=MAX_RETRIES):
-    last_error = "unknown_error"
-    for attempt in range(max_retries):
-        try:
-            result = func()
-            if result.status_code == 200:
-                return result, None, attempt
-            try:
-                data = result.json()
-                if "error" in data:
-                    error_msg = str(data.get("error", ""))
-                    if "rate limit" in error_msg.lower():
-                        last_error = "rate_limit"
-                        continue
-                    else:
-                        last_error = f"upstream_error_{result.status_code}"
-                        return result, last_error, attempt
-            except:
-                last_error = f"http_error_{result.status_code}"
-                return result, last_error, attempt
-            return result, None, attempt
-        except requests.exceptions.Timeout:
-            last_error = "timeout"
-            if attempt < max_retries - 1:
-                continue
-        except requests.exceptions.ConnectionError:
-            last_error = "connection_error"
-            if attempt < max_retries - 1:
-                continue
-        except Exception as e:
-            last_error = f"exception_{type(e).__name__}"
-            if attempt < max_retries - 1:
-                continue
-    return None, last_error, max_retries - 1
-
 @app.route('/v1/chat/completions', methods=['POST'])
 def proxy_chat():
     auth_header = request.headers.get('Authorization')
     if not auth_header or auth_header != f"Bearer {MY_ACCESS_KEY}":
         log_request("/v1/chat/completions", "failed", "auth_error", 0)
-        return jsonify({"error": {"message": "Permission Denied", "type": "auth_error"}}), 401
+        return {"error": {"message": "Permission Denied", "type": "auth_error"}}, 401
 
-    # ✅ 关键改动：直接获取原始数据
     raw_data = request.get_data()
     
+    # 尝试判断是否是流式请求
     try:
-        req_data = request.json
+        req_data = request.get_json()
         is_stream = req_data.get('stream', False)
     except:
-        # 如果 JSON 解析失败，我们假设它不是流式请求
         is_stream = False
 
-    if is_stream:
-        def generate():
-            for attempt in range(MAX_RETRIES):
-                try:
-                    resp = requests.post(
-                        f"{PROXY_URL}/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-                        data=raw_data,  # ✅ 使用原始数据
-                        stream=True,
-                        timeout=180
-                    )
-                    
-                    if resp.status_code == 200:
-                        log_request("/v1/chat/completions", "success", None, attempt)
-                        for line in resp.iter_lines():
-                            if line:
-                                decoded = line.decode('utf-8')
-                                if not decoded.startswith('data: '):
-                                    decoded = 'data: ' + decoded
-                                yield decoded + '\n\n'
-                        return
-                    else:
-                        try:
-                            data = resp.json()
-                            if "error" in data and "rate limit" in str(data.get("error", "")).lower():
-                                if attempt < MAX_RETRIES - 1:
-                                    continue
-                                else:
-                                    log_request("/v1/chat/completions", "failed", "rate_limit", attempt)
-                                    yield 'data: {"error":{"message":"错误重试全都rate limit,请再次重试.","type":"rate_limit_error"}}\n\n'
-                                    return
-                        except:
-                            pass
-                        
-                        log_request("/v1/chat/completions", "failed", f"http_{resp.status_code}", attempt)
-                        yield f'data: {{"error":{{"message":"上游返回错误: {resp.status_code}","type":"upstream_error"}}}}\n\n'
-                        return
-                        
-                except requests.exceptions.Timeout:
-                    if attempt < MAX_RETRIES - 1:
-                        continue
-                    log_request("/v1/chat/completions", "failed", "timeout", attempt)
-                    yield 'data: {"error":{"message":"请求超时，文档可能过大或网络不稳定.","type":"timeout_error"}}\n\n'
-                    return
-                except Exception as e:
-                    if attempt < MAX_RETRIES - 1:
-                        continue
-                    log_request("/v1/chat/completions", "failed", f"exception_{type(e).__name__}", attempt)
-                    yield f'data: {{"error":{{"message":"请求异常: {type(e).__name__}","type":"proxy_error"}}}}\n\n'
-                    return
-            
-            log_request("/v1/chat/completions", "failed", "all_retries_failed", MAX_RETRIES - 1)
-            yield 'data: {"error":{"message":"所有重试都失败了","type":"proxy_error"}}\n\n'
-        
-        return Response(generate(), content_type='text/event-stream')
-    
-    else:
-        def make_request():
-            return requests.post(
+    # 重试逻辑
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.post(
                 f"{PROXY_URL}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-                data=raw_data,  # ✅ 使用原始数据
-                timeout=180
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                data=raw_data,
+                stream=is_stream,
+                timeout=300
             )
-        
-        resp, error, retry_count = smart_retry_non_stream(make_request)
-        if resp:
-            try:
-                data = resp.json()
-                log_request("/v1/chat/completions", "success", None, retry_count)
-                return jsonify(data), resp.status_code
-            except:
-                log_request("/v1/chat/completions", "failed", "parse_error", retry_count)
-                return jsonify({"error": {"message": "上游返回了无效的响应", "type": "parse_error"}}), 500
-        
-        log_request("/v1/chat/completions", "failed", error, retry_count)
-        
-        if error == "rate_limit":
-            return jsonify({"error": {"message": "错误重试全都rate limit,请再次重试.", "type": "rate_limit_error"}}), 429
-        elif error == "timeout":
-            return jsonify({"error": {"message": "请求超时，文档可能过大或网络不稳定.", "type": "timeout_error"}}), 504
-        elif error == "connection_error":
-            return jsonify({"error": {"message": "无法连接到上游服务器", "type": "connection_error"}}), 503
-        else:
-            return jsonify({"error": {"message": f"请求失败: {error}", "type": "proxy_error"}}), 500
+            
+            # 检查是否需要重试
+            if resp.status_code != 200:
+                try:
+                    error_data = resp.json()
+                    if "error" in error_data and "rate limit" in str(error_data.get("error", "")).lower():
+                        if attempt < MAX_RETRIES - 1:
+                            continue  # 重试
+                        else:
+                            log_request("/v1/chat/completions", "failed", "rate_limit", attempt)
+                except:
+                    pass
+            
+            # 成功或非限流错误，直接返回
+            if is_stream:
+                log_request("/v1/chat/completions", "success", None, attempt)
+                
+                def generate():
+                    try:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                yield chunk
+                    except Exception as e:
+                        print(f"[ERROR] Stream error: {e}")
+                
+                return Response(
+                    generate(),
+                    status=resp.status_code,
+                    headers=dict(resp.headers)
+                )
+            else:
+                log_request("/v1/chat/completions", "success" if resp.status_code == 200 else "failed", None, attempt)
+                return Response(
+                    resp.content,
+                    status=resp.status_code,
+                    headers=dict(resp.headers)
+                )
+                
+        except requests.exceptions.Timeout:
+            if attempt < MAX_RETRIES - 1:
+                continue
+            log_request("/v1/chat/completions", "failed", "timeout", attempt)
+            return {"error": {"message": "请求超时", "type": "timeout_error"}}, 504
+            
+        except Exception as e:
+            print(f"[ERROR] Request exception: {type(e).__name__}: {e}")
+            if attempt < MAX_RETRIES - 1:
+                continue
+            log_request("/v1/chat/completions", "failed", f"exception_{type(e).__name__}", attempt)
+            return {"error": {"message": f"请求失败: {type(e).__name__}", "type": "proxy_error"}}, 500
+    
+    # 所有重试都失败
+    log_request("/v1/chat/completions", "failed", "all_retries_failed", MAX_RETRIES - 1)
+    return {"error": {"message": "所有重试都失败了", "type": "proxy_error"}}, 500
 
 @app.route('/v1/models', methods=['GET'])
 def proxy_models():
     auth_header = request.headers.get('Authorization')
     if not auth_header or auth_header != f"Bearer {MY_ACCESS_KEY}":
-        return jsonify({"error": {"message": "Permission Denied", "type": "auth_error"}}), 401
+        return {"error": {"message": "Permission Denied", "type": "auth_error"}}, 401
     try:
-        resp = requests.get(f"{PROXY_URL}/v1/models", headers={"Authorization": f"Bearer {API_KEY}"}, timeout=20)
-        return jsonify(resp.json()), resp.status_code
+        resp = requests.get(
+            f"{PROXY_URL}/v1/models",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=20
+        )
+        return Response(resp.content, status=resp.status_code, headers=dict(resp.headers))
     except:
-        return jsonify({"error": {"message": "Failed to fetch models", "type": "proxy_error"}}), 500
+        return {"error": {"message": "Failed to fetch models", "type": "proxy_error"}}, 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return {"status": "ok"}, 200
 
 @app.route('/')
 def dashboard():
@@ -236,55 +186,11 @@ def dashboard():
             color: #1976d2;
         }
         .retry-badge.high { background: #fff3e0; color: #f57c00; }
-        .refresh { background: #2196f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; margin-right: 10px; }
+        .refresh { background: #2196f3; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
         .refresh:hover { background: #1976d2; }
-        .auto-refresh-toggle { background: #4caf50; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin-bottom: 20px; }
-        .auto-refresh-toggle.off { background: #9e9e9e; }
         .info { background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3; }
         .info strong { color: #1976d2; }
-        .auto-refresh-status { display: inline-block; margin-left: 10px; color: #666; font-size: 14px; }
     </style>
-    <script>
-        let autoRefreshEnabled = true;
-        let countdown = 5;
-        let countdownId;
-
-        function toggleAutoRefresh() {
-            autoRefreshEnabled = !autoRefreshEnabled;
-            const btn = document.getElementById('autoRefreshBtn');
-            const status = document.getElementById('refreshStatus');
-            
-            if (autoRefreshEnabled) {
-                btn.textContent = '⏸️ 暂停自动刷新';
-                btn.classList.remove('off');
-                startCountdown();
-            } else {
-                btn.textContent = '▶️ 启动自动刷新';
-                btn.classList.add('off');
-                status.textContent = '已暂停';
-                clearInterval(countdownId);
-            }
-        }
-
-        function startCountdown() {
-            countdown = 5;
-            const status = document.getElementById('refreshStatus');
-            
-            countdownId = setInterval(() => {
-                if (autoRefreshEnabled) {
-                    countdown--;
-                    status.textContent = `${countdown} 秒后刷新`;
-                    if (countdown <= 0) {
-                        location.reload();
-                    }
-                }
-            }, 1000);
-        }
-
-        window.onload = function() {
-            startCountdown();
-        };
-    </script>
 </head>
 <body>
     <div class="container">
@@ -294,12 +200,10 @@ def dashboard():
             <strong>API 接入地址：</strong> https://你的域名/v1/chat/completions<br>
             <strong>模型列表：</strong> https://你的域名/v1/models<br>
             <strong>最大重试次数：</strong> {{ max_retries }} 次（快速重试，无延迟）<br>
-            <strong>请求超时时间：</strong> 180 秒
+            <strong>请求超时时间：</strong> 300 秒
         </div>
         
-        <button class="refresh" onclick="location.reload()">🔄 立即刷新</button>
-        <button id="autoRefreshBtn" class="auto-refresh-toggle" onclick="toggleAutoRefresh()">⏸️ 暂停自动刷新</button>
-        <span id="refreshStatus" class="auto-refresh-status">5 秒后刷新</span>
+        <button class="refresh" onclick="location.reload()">🔄 刷新数据</button>
         
         <div class="stats">
             <div class="stat-card">
