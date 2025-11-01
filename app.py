@@ -55,9 +55,16 @@ def smart_retry(func, max_retries=MAX_RETRIES):
                 return result, None, attempt, None
             try:
                 data = result.json()
-                if "error" in data and "rate limit" in str(data.get("error", "")).lower():
+                error_msg = str(data.get("error", {}))
+                
+                if "sensitive" in error_msg.lower():
+                    last_error = "sensitive_words"
+                    last_detail = "上游检测到敏感词"
+                    return None, last_error, attempt, last_detail
+                
+                if "rate limit" in error_msg.lower() or "rate_limit" in error_msg.lower():
                     last_error = "rate_limit"
-                    last_detail = str(data.get("error"))[:200]
+                    last_detail = error_msg[:200]
                     continue
                 else:
                     last_error = f"http_{result.status_code}"
@@ -72,15 +79,6 @@ def smart_retry(func, max_retries=MAX_RETRIES):
             last_detail = "请求超时(60秒)"
             if attempt < max_retries - 1:
                 continue
-        except requests.exceptions.ConnectionError as e:
-            last_error = "connection_error"
-            last_detail = str(e)[:200]
-            if attempt < max_retries - 1:
-                continue
-        except json.JSONDecodeError as e:
-            last_error = "json_encode_error"
-            last_detail = f"JSON编码失败: {str(e)[:200]}"
-            return None, last_error, attempt, last_detail  # JSON错误不重试
         except Exception as e:
             last_error = type(e).__name__
             last_detail = str(e)[:200]
@@ -89,6 +87,7 @@ def smart_retry(func, max_retries=MAX_RETRIES):
     
     return None, last_error or "unknown", max_retries - 1, last_detail or "未知错误"
 
+# --- OpenAI 格式接口 ---
 @app.route('/v1/chat/completions', methods=['POST'])
 def proxy_chat():
     auth_header = request.headers.get('Authorization')
@@ -100,16 +99,9 @@ def proxy_chat():
         req_data = request.json
     except Exception as e:
         log_request("/v1/chat/completions", "failed", "invalid_json", 0, str(e)[:200])
-        return jsonify({"error": "Invalid JSON in request"}), 400
+        return jsonify({"error": "Invalid JSON"}), 400
 
     is_stream = req_data.get('stream', False)
-
-    # 验证请求数据可以被序列化
-    try:
-        json.dumps(req_data)
-    except Exception as e:
-        log_request("/v1/chat/completions", "failed", "json_serialize_error", 0, str(e)[:200])
-        return jsonify({"error": "Request data cannot be serialized to JSON"}), 400
 
     if is_stream:
         def generate():
@@ -117,9 +109,7 @@ def proxy_chat():
                 return requests.post(
                     f"{PROXY_URL}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-                    json=req_data, 
-                    stream=True, 
-                    timeout=60
+                    json=req_data, stream=True, timeout=60
                 )
             resp, error, retry_count, detail = smart_retry(make_request)
             if resp and resp.status_code == 200:
@@ -134,16 +124,17 @@ def proxy_chat():
                 log_request("/v1/chat/completions", "failed", error, retry_count, detail)
                 if error == "rate_limit":
                     yield 'data: {"error":"错误重试全都rate limit,请再次重试."}\n\n'
+                elif error == "sensitive_words":
+                    yield 'data: {"error":"内容包含敏感词，已被上游拦截"}\n\n'
                 else:
-                    yield f'data: {{"error":"请求失败: {error}", "detail": "{detail}"}}\n\n'
+                    yield f'data: {{"error":"请求失败: {error}"}}\n\n'
         return Response(generate(), content_type='text/event-stream')
     else:
         def make_request():
             return requests.post(
                 f"{PROXY_URL}/v1/chat/completions",
                 headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-                json=req_data, 
-                timeout=60
+                json=req_data, timeout=60
             )
         resp, error, retry_count, detail = smart_retry(make_request)
         if resp:
@@ -157,8 +148,93 @@ def proxy_chat():
         log_request("/v1/chat/completions", "failed", error, retry_count, detail)
         if error == "rate_limit":
             return jsonify({"error": "错误重试全都rate limit,请再次重试."}), 429
+        elif error == "sensitive_words":
+            return jsonify({"error": "内容包含敏感词，已被上游拦截"}), 400
         else:
             return jsonify({"error": f"请求失败: {error}", "detail": detail}), 500
+
+# --- Anthropic (Claude) 格式接口 ---
+@app.route('/v1/messages', methods=['POST'])
+def proxy_anthropic():
+    auth_header = request.headers.get('x-api-key') or request.headers.get('Authorization')
+    
+    # 支持两种认证方式
+    if auth_header:
+        if auth_header.startswith('Bearer '):
+            auth_header = auth_header[7:]
+        if auth_header != MY_ACCESS_KEY:
+            log_request("/v1/messages", "failed", "auth_error", 0)
+            return jsonify({"error": {"type": "authentication_error", "message": "Invalid API Key"}}), 401
+    else:
+        log_request("/v1/messages", "failed", "auth_error", 0)
+        return jsonify({"error": {"type": "authentication_error", "message": "Missing API Key"}}), 401
+
+    try:
+        req_data = request.json
+    except Exception as e:
+        log_request("/v1/messages", "failed", "invalid_json", 0, str(e)[:200])
+        return jsonify({"error": {"type": "invalid_request_error", "message": "Invalid JSON"}}), 400
+
+    is_stream = req_data.get('stream', False)
+
+    if is_stream:
+        def generate():
+            def make_request():
+                headers = {
+                    "x-api-key": API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json"
+                }
+                return requests.post(
+                    f"{PROXY_URL}/v1/messages",
+                    headers=headers,
+                    json=req_data, stream=True, timeout=60
+                )
+            resp, error, retry_count, detail = smart_retry(make_request)
+            if resp and resp.status_code == 200:
+                log_request("/v1/messages", "success", None, retry_count)
+                for line in resp.iter_lines():
+                    if line:
+                        yield line.decode('utf-8') + '\n'
+            else:
+                log_request("/v1/messages", "failed", error, retry_count, detail)
+                error_response = {
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error" if error == "rate_limit" else "api_error",
+                        "message": detail or "请求失败"
+                    }
+                }
+                yield f"data: {json.dumps(error_response)}\n\n"
+        return Response(generate(), content_type='text/event-stream')
+    else:
+        def make_request():
+            headers = {
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            }
+            return requests.post(
+                f"{PROXY_URL}/v1/messages",
+                headers=headers,
+                json=req_data, timeout=60
+            )
+        resp, error, retry_count, detail = smart_retry(make_request)
+        if resp:
+            try:
+                log_request("/v1/messages", "success", None, retry_count)
+                return jsonify(resp.json()), resp.status_code
+            except Exception as e:
+                log_request("/v1/messages", "failed", "parse_error", retry_count, str(e)[:200])
+                return jsonify({"error": {"type": "api_error", "message": "Invalid response"}}), 500
+        
+        log_request("/v1/messages", "failed", error, retry_count, detail)
+        return jsonify({
+            "error": {
+                "type": "rate_limit_error" if error == "rate_limit" else "api_error",
+                "message": detail or "请求失败"
+            }
+        }), 429 if error == "rate_limit" else 500
 
 @app.route('/v1/models', methods=['GET'])
 def proxy_models():
@@ -228,7 +304,8 @@ def dashboard():
         <h1>🚀 LLM Proxy 管理面板</h1>
         
         <div class="info">
-            <strong>API 接入地址：</strong> https://你的域名/v1/chat/completions<br>
+            <strong>OpenAI 格式：</strong> https://你的域名/v1/chat/completions<br>
+            <strong>Anthropic 格式：</strong> https://你的域名/v1/messages<br>
             <strong>模型列表：</strong> https://你的域名/v1/models<br>
             <strong>最大重试次数：</strong> {{ max_retries }} 次（快速重试，无延迟）
         </div>
