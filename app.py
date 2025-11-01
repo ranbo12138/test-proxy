@@ -96,17 +96,30 @@ def proxy_chat():
                     except Exception as e:
                         print(f"[ERROR] Stream error: {e}")
                 
+                # 只保留必要的 headers
+                response_headers = {
+                    'Content-Type': resp.headers.get('Content-Type', 'text/event-stream'),
+                    'Cache-Control': 'no-cache',
+                    'X-Accel-Buffering': 'no'
+                }
+                
                 return Response(
                     generate(),
                     status=resp.status_code,
-                    headers=dict(resp.headers)
+                    headers=response_headers
                 )
             else:
                 log_request("/v1/chat/completions", "success" if resp.status_code == 200 else "failed", None, attempt)
+                
+                # 只保留必要的 headers
+                response_headers = {
+                    'Content-Type': resp.headers.get('Content-Type', 'application/json')
+                }
+                
                 return Response(
                     resp.content,
                     status=resp.status_code,
-                    headers=dict(resp.headers)
+                    headers=response_headers
                 )
                 
         except requests.exceptions.Timeout:
@@ -137,7 +150,11 @@ def proxy_models():
             headers={"Authorization": f"Bearer {API_KEY}"},
             timeout=20
         )
-        return Response(resp.content, status=resp.status_code, headers=dict(resp.headers))
+        return Response(
+            resp.content,
+            status=resp.status_code,
+            headers={'Content-Type': 'application/json'}
+        )
     except:
         return {"error": {"message": "Failed to fetch models", "type": "proxy_error"}}, 500
 
