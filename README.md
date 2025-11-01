@@ -1,6 +1,3 @@
-## **完整的 `README.md`**
-
-```markdown
 # 🚀 LLM Proxy - 智能 API 代理服务
 
 [English](#english) | [中文](#chinese)
